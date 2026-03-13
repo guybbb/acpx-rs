@@ -185,10 +185,14 @@ struct AcpClient {
 impl AcpClient {
     fn start(agent_command: &str, cwd: &Path, log_path: PathBuf) -> Result<Self> {
         let (command, args) = split_command_line(agent_command)?;
-        let mut child = Command::new(&command)
-            .args(args)
-            .current_dir(cwd)
-            .env_remove("CLAUDECODE")
+        let mut cmd = Command::new(&command);
+        cmd.args(args);
+        // Only set cwd if accessible (cross-user agents handle their own cwd)
+        if cwd.is_dir() {
+            cmd.current_dir(cwd);
+        }
+        cmd.env_remove("CLAUDECODE");
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
