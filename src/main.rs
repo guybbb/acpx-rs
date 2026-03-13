@@ -41,6 +41,9 @@ struct PromptArgs {
     #[arg(short = 's', long = "session")]
     session: String,
 
+    #[arg(long)]
+    json: bool,
+
     #[arg(trailing_var_arg = true, required = true)]
     text: Vec<String>,
 }
@@ -593,27 +596,38 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
     write_line_json(&mut stream, &request)?;
 
     let mut reader = BufReader::new(stream);
+    let json_mode = args.json;
     loop {
         let Some(event) = read_line_json::<OwnerEvent, _>(&mut reader)? else {
             break;
         };
-        match event {
-            OwnerEvent::Chunk { text } => {
-                print!("{text}");
-                std::io::stdout().flush()?;
+        if json_mode {
+            println!("{}", serde_json::to_string(&event)?);
+            std::io::stdout().flush()?;
+            match event {
+                OwnerEvent::Done { .. } => return Ok(()),
+                OwnerEvent::Error { message } => bail!("{message}"),
+                _ => {}
             }
-            OwnerEvent::Thought { text } => {
-                eprint!("\x1b[2m[thinking] {text}\x1b[0m");
-                std::io::stderr().flush()?;
-            }
-            OwnerEvent::Done { text, .. } => {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    println!();
+        } else {
+            match event {
+                OwnerEvent::Chunk { text } => {
+                    print!("{text}");
+                    std::io::stdout().flush()?;
                 }
-                return Ok(());
+                OwnerEvent::Thought { text } => {
+                    eprint!("\x1b[2m[thinking] {text}\x1b[0m");
+                    std::io::stderr().flush()?;
+                }
+                OwnerEvent::Done { text, .. } => {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        println!();
+                    }
+                    return Ok(());
+                }
+                OwnerEvent::Error { message } => bail!("{message}"),
+                other => bail!("unexpected owner event: {}", serde_json::to_string(&other)?),
             }
-            OwnerEvent::Error { message } => bail!("{message}"),
-            other => bail!("unexpected owner event: {}", serde_json::to_string(&other)?),
         }
     }
 
