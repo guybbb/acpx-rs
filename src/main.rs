@@ -455,6 +455,7 @@ impl AcpClient {
                         } else {
                             format!("agent process exited ({status}) while waiting for {method} response.\nAgent stderr:\n{stderr}")
                         };
+                        self.log_error(&detail);
                         bail!("{detail}");
                     }
                     continue;
@@ -466,6 +467,7 @@ impl AcpClient {
                     } else {
                         format!("agent closed stdout before responding.\nAgent stderr:\n{stderr}")
                     };
+                    self.log_error(&detail);
                     bail!("{detail}");
                 }
             };
@@ -577,6 +579,17 @@ impl AcpClient {
             return;
         };
         let _ = writeln!(file, "[acp:{direction}] {}", value);
+    }
+
+    fn log_error(&self, message: &str) {
+        let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+        else {
+            return;
+        };
+        let _ = writeln!(file, "[error] {message}");
     }
 }
 
