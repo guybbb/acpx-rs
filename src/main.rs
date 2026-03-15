@@ -9,6 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -183,7 +184,11 @@ struct AcpClient {
     messages: Receiver<Value>,
     next_id: u64,
     log_path: PathBuf,
+    stderr_tail: Arc<Mutex<Vec<String>>>,
 }
+
+/// Max stderr lines to keep in memory for crash diagnostics.
+const STDERR_TAIL_LINES: usize = 50;
 
 impl AcpClient {
     fn start(agent_command: &str, cwd: &Path, log_path: PathBuf) -> Result<Self> {
@@ -198,11 +203,12 @@ impl AcpClient {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| format!("failed to spawn agent: {agent_command}"))?;
 
         let child_stdout = child.stdout.take().context("missing agent stdout")?;
+        let child_stderr = child.stderr.take().context("missing agent stderr")?;
         let child_stdin = child.stdin.take().context("missing agent stdin")?;
         let (tx, rx) = mpsc::channel();
 
@@ -224,12 +230,42 @@ impl AcpClient {
             }
         });
 
+        // Capture stderr into a ring buffer and log to session log file
+        let stderr_tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let stderr_tail_writer = Arc::clone(&stderr_tail);
+        let stderr_log_path = log_path.clone();
+        thread::spawn(move || {
+            let reader = BufReader::new(child_stderr);
+            let mut log_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&stderr_log_path)
+                .ok();
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Some(ref mut f) = log_file {
+                    let _ = writeln!(f, "[agent:stderr] {trimmed}");
+                }
+                if let Ok(mut tail) = stderr_tail_writer.lock() {
+                    tail.push(trimmed.to_owned());
+                    if tail.len() > STDERR_TAIL_LINES {
+                        tail.remove(0);
+                    }
+                }
+            }
+        });
+
         let mut client = Self {
             child,
             stdin: BufWriter::new(child_stdin),
             messages: rx,
             next_id: 1,
             log_path,
+            stderr_tail,
         };
         client.initialize()?;
         Ok(client)
@@ -237,6 +273,14 @@ impl AcpClient {
 
     fn agent_pid(&self) -> u32 {
         self.child.id()
+    }
+
+    fn last_stderr(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .ok()
+            .map(|lines| lines.join("\n"))
+            .unwrap_or_default()
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -393,10 +437,34 @@ impl AcpClient {
         self.write_json(&request)?;
 
         loop {
-            let message = self
-                .messages
-                .recv()
-                .context("agent closed stdout before responding")?;
+            // Poll with timeout so we can detect dead agent processes.
+            // Some agents (e.g. Gemini/node) spawn children that inherit stdout,
+            // keeping the pipe open after the main process exits.
+            let message = match self.messages.recv_timeout(Duration::from_secs(5)) {
+                Ok(msg) => msg,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Check if child is still alive
+                    if let Some(status) = self.child.try_wait()? {
+                        let stderr = self.last_stderr();
+                        let detail = if stderr.is_empty() {
+                            format!("agent process exited ({status}) while waiting for {method} response")
+                        } else {
+                            format!("agent process exited ({status}) while waiting for {method} response.\nAgent stderr:\n{stderr}")
+                        };
+                        bail!("{detail}");
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let stderr = self.last_stderr();
+                    let detail = if stderr.is_empty() {
+                        "agent closed stdout before responding".to_owned()
+                    } else {
+                        format!("agent closed stdout before responding.\nAgent stderr:\n{stderr}")
+                    };
+                    bail!("{detail}");
+                }
+            };
             self.log_json("inbound", &message);
 
             if let Some(method_name) = message.get("method").and_then(Value::as_str) {
@@ -689,17 +757,26 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
     let mut client = AcpClient::start(&record.agent_command, &cwd, paths.log_path(&record.name))?;
     let session_id = client.new_session(&cwd)?;
 
-    // Apply config after session creation (required by some agents like Codex)
+    // Apply config after session creation (required by some agents like Codex).
+    // Non-fatal: some agents (e.g. Gemini) don't support set_config_option/set_mode.
     if let Some(ref mode) = record.config_mode {
-        client.set_mode(&session_id, mode)?;
+        if let Err(e) = client.set_mode(&session_id, mode) {
+            eprintln!("warning: set_mode failed (agent may not support it): {e:#}");
+        }
     }
     if let Some(ref model) = record.config_model {
         // Split composite model IDs like "gpt-5.4/high" into model + reasoning_effort
         if let Some((base, effort)) = model.split_once('/') {
-            client.set_config_option(&session_id, "model", base)?;
-            client.set_config_option(&session_id, "reasoning_effort", effort)?;
+            if let Err(e) = client.set_config_option(&session_id, "model", base) {
+                eprintln!("warning: set_config_option(model) failed: {e:#}");
+            }
+            if let Err(e) = client.set_config_option(&session_id, "reasoning_effort", effort) {
+                eprintln!("warning: set_config_option(reasoning_effort) failed: {e:#}");
+            }
         } else {
-            client.set_config_option(&session_id, "model", model)?;
+            if let Err(e) = client.set_config_option(&session_id, "model", model) {
+                eprintln!("warning: set_config_option(model) failed: {e:#}");
+            }
         }
     }
 

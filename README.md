@@ -109,6 +109,104 @@ You can override the root directory with `--home`.
 
 The speedup comes from reusing a live ACP session instead of re-spawning and re-initializing the agent for every prompt. For iterative coding, debugging, and operator-style workflows, that usually matters more than shaving a few milliseconds off the CLI itself.
 
+## OpenClaw Integration
+
+acpx-rs can run as an OpenClaw ACP runtime backend via a plugin. This lets the OpenClaw agent spawn and manage ACP sessions (Codex, Gemini, Claude Code) through the gateway.
+
+### Files
+
+| Component | Location |
+|-----------|----------|
+| Plugin source | `~/repos/openclaw/extensions/acpx-rs/` |
+| Plugin deploy | `~/.openclaw/extensions/acpx-rs/` (global extensions dir, survives npm updates) |
+| Skill | `~/.openclaw/workspace/skills/acpx-rs/SKILL.md` |
+| Binary (system) | `/usr/local/bin/acpx-rs` |
+| Binary (skill-local) | `~/.openclaw/workspace/skills/acpx-rs/acpx-rs` |
+
+### Install / Update
+
+Build and deploy the binary:
+
+```bash
+cd ~/repos/acpx-rs
+cargo build --release
+sudo cp target/release/acpx /usr/local/bin/acpx-rs
+sudo cp target/release/acpx ~/.openclaw/workspace/skills/acpx-rs/acpx-rs
+sudo chown openclaw:openclaw ~/.openclaw/workspace/skills/acpx-rs/acpx-rs
+```
+
+Deploy the plugin (run once, or after plugin source changes):
+
+```bash
+sudo mkdir -p /home/openclaw/.openclaw/extensions/acpx-rs/src
+sudo cp ~/repos/openclaw/extensions/acpx-rs/{package.json,index.ts,openclaw.plugin.json} \
+  /home/openclaw/.openclaw/extensions/acpx-rs/
+sudo cp ~/repos/openclaw/extensions/acpx-rs/src/{runtime.ts,service.ts} \
+  /home/openclaw/.openclaw/extensions/acpx-rs/src/
+sudo chown -R openclaw:openclaw /home/openclaw/.openclaw/extensions/acpx-rs/
+```
+
+Do **not** put the plugin in `node_modules` — it gets wiped on every `openclaw update`.
+
+### Configuration
+
+```bash
+# Binary path
+sudo -u openclaw openclaw config set plugins.entries.acpx-rs.config.command /usr/local/bin/acpx-rs
+
+# Default model and startup timeout
+sudo -u openclaw openclaw config set plugins.entries.acpx-rs.config.defaultModel "gpt-5.4/high"
+sudo -u openclaw openclaw config set plugins.entries.acpx-rs.config.startupTimeout 60
+
+# Agent mappings
+sudo -u openclaw openclaw config set plugins.entries.acpx-rs.config.agents.codex.command "npx -y @zed-industries/codex-acp"
+sudo -u openclaw openclaw config set plugins.entries.acpx-rs.config.agents.codex.model "gpt-5.4/high"
+sudo -u openclaw openclaw config set plugins.entries.acpx-rs.config.agents.codex.mode "auto"
+sudo -u openclaw openclaw config set plugins.entries.acpx-rs.config.agents.claude.command "npx -y @zed-industries/claude-agent-acp"
+sudo -u openclaw openclaw config set plugins.entries.acpx-rs.config.agents.gemini.command "gemini --experimental-acp --yolo -m gemini-3.1-pro-preview"
+
+# Set as default ACP backend
+sudo -u openclaw openclaw config set acp.backend acpx-rs
+```
+
+Restart the gateway to apply:
+
+```bash
+sudo systemctl restart openclaw-gateway.service
+```
+
+### Agent compatibility notes
+
+| Agent | set_config_option | set_mode | Notes |
+|-------|-------------------|----------|-------|
+| Codex (`codex-acp`) | Yes | Yes | Model/mode applied via ACP protocol after session init |
+| Claude (`claude-agent-acp`) | Yes | Yes | Strips `CLAUDECODE` env var automatically |
+| Gemini (`gemini --experimental-acp`) | No | Partial (only `default`/`autoEdit`/`yolo`) | Pass `-m <model>` in the command string; `set_config_option` and unsupported modes fail gracefully with a warning |
+
+Key: Gemini's ACP adapter uses `--experimental-acp` (not `--acp`), and does not support `session/set_config_option`. The model must be baked into the agent command via `-m`. The `set_config_option` and `set_mode` failures are non-fatal — the session continues.
+
+### Verify
+
+Check gateway logs after restart:
+
+```bash
+sudo journalctl -u openclaw-gateway.service --since "1 min ago" | grep "acpx-rs"
+# Expect:
+#   acpx-rs runtime backend registered (command: /usr/local/bin/acpx-rs)
+#   acpx-rs runtime backend ready
+```
+
+Test directly:
+
+```bash
+sudo -u openclaw /usr/local/bin/acpx-rs sessions ensure \
+  --name test --agent "npx -y @zed-industries/codex-acp" \
+  --model "gpt-5.4/high" --mode "auto" --cwd /tmp --startup-timeout 60
+
+sudo -u openclaw /usr/local/bin/acpx-rs prompt -s test "Say hello"
+sudo -u openclaw /usr/local/bin/acpx-rs sessions close test
+```
+
 ## Project Status
 
 Early, focused, and usable. The current implementation is intentionally small: one binary, one job, minimal ceremony.
