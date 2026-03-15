@@ -49,6 +49,7 @@ When user names a harness, map to these `--agent` values:
 - "codex" → `--agent "npx -y @zed-industries/codex-acp"`
 - "claude" or "claude code" → `--agent "npx -y @zed-industries/claude-agent-acp"`
 - "gemini" or "gemini cli" → `--agent "gemini --experimental-acp --yolo"`
+- "investment" or "trading agent" → `--agent "/home/openclaw/.openclaw/workspace-trading/trading-app/.venv/bin/python /home/openclaw/.openclaw/workspace-trading/trading-app/run.py --investment-agent-acp"`
 - "pi" → `--agent "pi --acp"`
 
 ## Model and mode
