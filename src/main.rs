@@ -185,6 +185,7 @@ struct AcpClient {
     next_id: u64,
     log_path: PathBuf,
     stderr_tail: Arc<Mutex<Vec<String>>>,
+    allowed_root: PathBuf,
 }
 
 /// Max stderr lines to keep in memory for crash diagnostics.
@@ -259,6 +260,7 @@ impl AcpClient {
             }
         });
 
+        let allowed_root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let mut client = Self {
             child,
             stdin: BufWriter::new(child_stdin),
@@ -266,6 +268,7 @@ impl AcpClient {
             next_id: 1,
             log_path,
             stderr_tail,
+            allowed_root,
         };
         client.initialize()?;
         Ok(client)
@@ -538,29 +541,67 @@ impl AcpClient {
         self.write_json(&message)
     }
 
+    /// Validate that a path is under the session's allowed root (cwd).
+    /// Resolves symlinks and `..` to prevent path traversal.
+    fn validate_path(&self, raw: &str) -> Result<PathBuf> {
+        let requested = Path::new(raw);
+        // Resolve to absolute: if relative, join with allowed_root
+        let absolute = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.allowed_root.join(requested)
+        };
+        // Canonicalize to resolve symlinks and .. components.
+        // For reads the file must exist; for writes the parent must exist.
+        let canonical = if let Ok(p) = absolute.canonicalize() {
+            p
+        } else {
+            // File may not exist yet (write). Canonicalize the parent.
+            let parent = absolute
+                .parent()
+                .context("no parent directory")?
+                .canonicalize()
+                .with_context(|| format!("cannot resolve parent of: {raw}"))?;
+            let name = absolute
+                .file_name()
+                .context("no file name")?;
+            parent.join(name)
+        };
+        if !canonical.starts_with(&self.allowed_root) {
+            bail!(
+                "path {} is outside the allowed workspace ({})",
+                canonical.display(),
+                self.allowed_root.display()
+            );
+        }
+        Ok(canonical)
+    }
+
     fn handle_server_request(&mut self, method: &str, params: Value) -> Result<Value> {
         match method {
             "requestPermission" | "session/request_permission" => Ok(handle_permission_request(&params)),
             "readTextFile" => {
-                let path = params
+                let raw = params
                     .get("path")
                     .and_then(Value::as_str)
                     .context("readTextFile missing path")?;
-                let content = fs::read_to_string(path)
-                    .with_context(|| format!("failed to read file {}", path))?;
+                let path = self.validate_path(raw)?;
+                let content = fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read file {}", path.display()))?;
                 Ok(json!({ "content": content }))
             }
             "writeTextFile" => {
-                let path = params
+                let raw = params
                     .get("path")
                     .and_then(Value::as_str)
                     .context("writeTextFile missing path")?;
+                let path = self.validate_path(raw)?;
                 let content = params
                     .get("content")
                     .and_then(Value::as_str)
                     .context("writeTextFile missing content")?;
-                fs::write(path, content)
-                    .with_context(|| format!("failed to write file {}", path))?;
+                fs::write(&path, content)
+                    .with_context(|| format!("failed to write file {}", path.display()))?;
                 Ok(json!({}))
             }
             "createTerminal" | "terminalOutput" | "waitForTerminalExit" | "killTerminal" | "releaseTerminal" => {
