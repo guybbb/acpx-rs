@@ -185,6 +185,13 @@ sudo systemctl restart openclaw-gateway.service
 
 Key: Gemini's ACP adapter uses `--experimental-acp` (not `--acp`), and does not support `session/set_config_option`. The model must be baked into the agent command via `-m`. The `set_config_option` and `set_mode` failures are non-fatal — the session continues.
 
+### Resilience
+
+- **Dead agent detection**: The daemon polls with `recv_timeout(5s)` + `try_wait()` to detect crashed agents, even when child processes keep stdout open.
+- **Stderr capture**: Agent stderr is logged to the session log as `[agent:stderr]` lines and the last 50 lines are included in error messages for crash diagnostics.
+- **Auto-exit on death**: When the agent dies during a prompt, the daemon marks the session closed and exits. The next `sessions ensure` recreates everything from scratch.
+- **Non-fatal config**: `set_config_option` and `set_mode` failures are warnings, not fatal — agents that don't support them (e.g. Gemini) still work.
+
 ### Verify
 
 Check gateway logs after restart:
