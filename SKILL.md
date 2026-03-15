@@ -112,43 +112,72 @@ Use `oc-<agent>-<conversationId>` where:
 - `<agent>` = codex, claude, gemini, pi, etc.
 - `<conversationId>` = thread id when available, otherwise channel/conversation id
 
+## Session lifecycle
+
+### How `sessions ensure` works
+
+`sessions ensure` is **idempotent** — it is safe to call before every prompt:
+- If the session **already exists and is alive**, it returns immediately (no-op). The existing agent keeps its full context and history.
+- If the session **is dead or closed**, it recreates everything from scratch (new agent, new ACP session).
+- If the session **does not exist**, it creates a new one.
+
+**Always call `sessions ensure` before sending a prompt.** This is your only entry point — it handles both first-time creation and recovery.
+
+### Session reuse — keep sessions alive
+
+Sessions are **tied to a project/workspace**, not to a single task. A warm session retains the agent's full context (loaded files, conversation history, workspace understanding), which makes follow-up tasks faster and more accurate.
+
+**Rules for session reuse:**
+- **Reuse sessions across related tasks in the same project.** If the user asks to fix a bug and then asks to add a test in the same repo, reuse the same session — the agent already knows the codebase.
+- **Do NOT close a session immediately after one task.** Keep it alive in case more tasks come for the same project.
+- **Close a session only when:** the user explicitly says they're done, the conversation ends, or you're switching to a completely different project/workspace.
+- **One session per agent per project.** Use the naming convention `oc-<agent>-<conversationId>` to naturally scope sessions to conversations.
+
+### Auto-recovery
+
+If a session dies (agent crash, broken pipe, timeout), the daemon automatically marks it as closed and exits. On the next call:
+1. `sessions ensure` detects the closed/dead state
+2. It recreates the session from scratch (new agent process, fresh ACP session)
+3. The new session is ready to accept prompts
+
+**You do not need to manually detect or handle crashes.** Just always call `sessions ensure` before `prompt` — if the session died, it gets rebuilt transparently. If the prompt itself fails, report the error to the user and offer to retry (the next `sessions ensure` + `prompt` will use a fresh session).
+
 ## Working with ACP sessions — autonomous flow
 
-When you spawn an ACP agent session to perform a task, follow this flow:
+When you spawn an ACP agent session to perform a task:
 
-1. **Create the session** with `sessions ensure`
-2. **Send the task prompt** — include all context the agent needs (cwd, files, goals, constraints)
-3. **Read the streamed response** — the `prompt` command streams the agent's full response including tool use and reasoning
-4. **Act on the result** — parse the agent's response, extract what was done, relay a summary to the user
-5. **Do NOT wait for user input** between steps 2–4. Complete the full cycle autonomously.
-6. **Report back** to the user only when the task is completed (or failed), with a concise summary of what was accomplished.
+1. **`sessions ensure`** — call before every prompt (creates or reuses)
+2. **`prompt`** — send the task with all needed context
+3. **Read the response** — the prompt command streams the full agent output
+4. **Report to user** — summarize what the agent did. Do NOT wait for user input between steps 2–4.
+5. **Keep the session alive** — do NOT close it unless the conversation is ending or the user is switching projects
 
 ### Key rules
 
-- **Never block on user input** while an ACP session is running. The agent works independently — let it finish, then report results.
-- **The prompt response IS the result.** The `prompt` command returns the agent's full response. Read it, summarize it, and relay to the user.
-- **Handle errors gracefully.** If the session dies (broken pipe, agent crash), report the failure reason from the error message and offer to retry.
-- **Close sessions when done.** After the task is complete, close the session with `sessions close` to free resources.
-- **Session auto-recovery.** If a session is closed or dead, `sessions ensure` recreates it from scratch. You can always retry.
+- **Never block on user input** while an ACP session is running. Let the agent finish, then report results.
+- **The prompt response IS the result.** Read it, summarize it, and relay to the user.
+- **Handle errors gracefully.** If a prompt fails, report the error and offer to retry. The next `sessions ensure` auto-recovers.
+- **Reuse sessions.** Do not close after every task. The agent retains context across prompts — this is the main value of persistent sessions.
 
-### Example autonomous flow
+### Example: multi-task reuse
 
 ```bash
 ACPX_CMD="~/.openclaw/workspace/skills/acpx-rs/acpx-rs"
 
-# 1. Create session
+# First task — session is created
 ${ACPX_CMD} sessions ensure --name oc-codex-123 \
   --agent "npx -y @zed-industries/codex-acp" \
   --model "gpt-5.4/high" --mode "auto" \
   --cwd /path/to/repo --startup-timeout 60
+${ACPX_CMD} prompt -s oc-codex-123 "Fix the failing test in src/utils.test.ts"
+# → report result to user, keep session alive
 
-# 2. Send task and capture response
-RESPONSE=$(${ACPX_CMD} prompt -s oc-codex-123 "Fix the failing test in src/utils.test.ts and commit the fix")
+# Second task — session is reused (agent already knows the codebase)
+${ACPX_CMD} sessions ensure --name oc-codex-123 ...  # no-op, session alive
+${ACPX_CMD} prompt -s oc-codex-123 "Now add a test for the edge case with empty input"
+# → report result to user, keep session alive
 
-# 3. RESPONSE now contains the agent's full output — summarize and relay to user
-# Do NOT ask the user what to do next. Just report what happened.
-
-# 4. Clean up
+# Conversation ends — clean up
 ${ACPX_CMD} sessions close oc-codex-123
 ```
 
