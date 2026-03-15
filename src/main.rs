@@ -275,6 +275,10 @@ impl AcpClient {
         self.child.id()
     }
 
+    fn is_agent_dead(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
     fn last_stderr(&self) -> String {
         self.stderr_tail
             .lock()
@@ -803,12 +807,24 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
             OwnerRequest::Prompt { text } => {
                 let response = handle_prompt(record_path, &session_id, &mut client, &text, &mut stream);
                 if let Err(error) = response {
+                    let msg = format!("{error:#}");
                     let _ = write_line_json(
                         &mut stream,
                         &OwnerEvent::Error {
-                            message: format!("{error:#}"),
+                            message: msg.clone(),
                         },
                     );
+                    // If the agent process is dead, exit the daemon so that
+                    // `sessions ensure` will detect the stale socket and
+                    // recreate everything from scratch.
+                    if client.is_agent_dead() {
+                        eprintln!("agent is dead, daemon exiting: {msg}");
+                        let mut record = load_record(record_path)?;
+                        record.closed = true;
+                        record.updated_at = iso_now();
+                        save_record(record_path, &record)?;
+                        break;
+                    }
                 }
             }
             OwnerRequest::Close => {
