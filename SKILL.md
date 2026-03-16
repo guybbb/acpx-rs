@@ -142,6 +142,43 @@ If a session dies (agent crash, broken pipe, timeout), the daemon automatically 
 
 **You do not need to manually detect or handle crashes.** Just always call `sessions ensure` before `prompt` — if the session died, it gets rebuilt transparently. If the prompt itself fails, report the error to the user and offer to retry (the next `sessions ensure` + `prompt` will use a fresh session).
 
+## Session cleanup and lifecycle management
+
+### Idle timeout
+
+Daemon processes automatically self-terminate after **30 minutes of inactivity** (no incoming connections). When the idle timeout fires, the daemon marks the session as closed and removes the socket. The next `sessions ensure` call will create a fresh session.
+
+Daemons also detect when their agent process dies while idle and exit immediately.
+
+### `sessions cleanup` — reap dead sessions and prune old data
+
+Run periodically (or manually) to clean up accumulated session data:
+
+```bash
+# Dry-run (show what would be cleaned, no changes)
+${ACPX_CMD} sessions cleanup
+
+# Actually clean up
+${ACPX_CMD} sessions cleanup --force
+```
+
+What it does:
+1. **Reaps dead daemons**: finds sessions where the daemon PID is dead but not marked closed, marks them closed, removes stale sockets
+2. **Prunes old session records**: deletes closed session JSON files older than 14 days (configurable via `--max-session-age-days`)
+3. **Truncates oversized logs**: logs larger than 500MB are truncated to keep the last 10MB (configurable via `--max-log-size-mb`)
+4. **Deletes old logs**: log files older than 7 days for closed/missing sessions are removed (configurable via `--max-log-age-days`)
+5. **Removes orphan sockets**: sockets with no matching session record or a closed session
+
+### `sessions list` — view all sessions
+
+```bash
+# List all sessions (active and closed)
+${ACPX_CMD} sessions list
+
+# List only active sessions
+${ACPX_CMD} sessions list --active
+```
+
 ## Working with ACP sessions — autonomous flow
 
 When you spawn an ACP agent session to perform a task:
@@ -152,12 +189,26 @@ When you spawn an ACP agent session to perform a task:
 4. **Report to user** — summarize what the agent did. Do NOT wait for user input between steps 2–4.
 5. **Keep the session alive** — do NOT close it unless the conversation is ending or the user is switching projects
 
+### Completion reporting — always confirm when done
+
+When dispatching work to an ACP agent, **always include a completion instruction** in your prompt so you (and the user) know the job finished. Append something like:
+
+> When you are done, end your response with a clear summary of what you did and confirm that the task is complete.
+
+This is critical because:
+- Without it, the agent may finish silently and you won't know whether the task succeeded, failed, or is still running
+- The user needs a clear signal that the dispatched work is done
+- It helps you decide whether to relay success or investigate further
+
+After receiving the `done` event from the prompt, **always report the outcome back to the user** — even if the agent's response is empty or terse. A simple "Codex finished: [summary]" is better than silence.
+
 ### Key rules
 
 - **Never block on user input** while an ACP session is running. Let the agent finish, then report results.
 - **The prompt response IS the result.** Read it, summarize it, and relay to the user.
 - **Handle errors gracefully.** If a prompt fails, report the error and offer to retry. The next `sessions ensure` auto-recovers.
 - **Reuse sessions.** Do not close after every task. The agent retains context across prompts — this is the main value of persistent sessions.
+- **Always confirm completion.** After the agent finishes, tell the user what happened. Never leave the user wondering if a dispatched job is still running.
 
 ### Example: multi-task reuse
 

@@ -16,6 +16,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const APP_NAME: &str = "acpx-rs";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SOCKET_WAIT_POLL_MS: u64 = 50;
+/// How long a daemon idles (no incoming connections) before self-terminating.
+const DAEMON_IDLE_TIMEOUT_SECS: u64 = 30 * 60; // 30 minutes
+/// Default max age (days) for closed session records during cleanup.
+const CLEANUP_MAX_SESSION_AGE_DAYS: u64 = 14;
+/// Default max age (days) for log files of closed/missing sessions during cleanup.
+const CLEANUP_MAX_LOG_AGE_DAYS: u64 = 7;
+/// Truncate individual log files larger than this (bytes).
+const CLEANUP_MAX_LOG_SIZE: u64 = 500 * 1024 * 1024; // 500 MB
+/// Keep the tail of truncated logs (bytes).
+const CLEANUP_LOG_TAIL_KEEP: u64 = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Parser, Debug)]
 #[command(name = "acpx", version = VERSION, about = "Persistent ACP session broker")]
@@ -60,6 +70,36 @@ enum SessionsCommand {
     Ensure(EnsureArgs),
     Last(SessionNameArgs),
     Close(SessionNameArgs),
+    /// List all sessions (active and closed)
+    List(ListArgs),
+    /// Clean up dead daemons, stale sockets, old session records, and oversized logs
+    Cleanup(CleanupArgs),
+}
+
+#[derive(Args, Debug)]
+struct ListArgs {
+    /// Show only active (non-closed) sessions
+    #[arg(long)]
+    active: bool,
+}
+
+#[derive(Args, Debug)]
+struct CleanupArgs {
+    /// Max age in days for closed session records (default: 14)
+    #[arg(long)]
+    max_session_age_days: Option<u64>,
+
+    /// Max age in days for log files of closed sessions (default: 7)
+    #[arg(long)]
+    max_log_age_days: Option<u64>,
+
+    /// Max log file size in MB before truncation (default: 500)
+    #[arg(long)]
+    max_log_size_mb: Option<u64>,
+
+    /// Actually delete/truncate (default is dry-run)
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -653,6 +693,8 @@ fn run() -> Result<()> {
             SessionsCommand::Ensure(args) => run_sessions_ensure(&paths, args),
             SessionsCommand::Last(args) => run_sessions_last(&paths, &args.name),
             SessionsCommand::Close(args) => run_sessions_close(&paths, &args.name),
+            SessionsCommand::List(args) => run_sessions_list(&paths, args),
+            SessionsCommand::Cleanup(args) => run_sessions_cleanup(&paths, args),
         },
         Commands::ServeSession(args) => run_session_daemon(&cli.home, &args.record),
     }
@@ -798,6 +840,202 @@ fn run_sessions_close(paths: &SessionPaths, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn run_sessions_list(paths: &SessionPaths, args: ListArgs) -> Result<()> {
+    let entries = fs::read_dir(&paths.sessions_dir)?;
+    let mut sessions: Vec<Value> = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(record) = load_record(&path) else { continue };
+        if args.active && record.closed {
+            continue;
+        }
+        let pid_alive = record.pid.map(|p| process_alive(p)).unwrap_or(false);
+        let sock_alive = socket_alive(Path::new(&record.socket_path));
+        let status = if record.closed {
+            "closed"
+        } else if pid_alive && sock_alive {
+            "running"
+        } else {
+            "stale"
+        };
+        sessions.push(json!({
+            "name": record.name,
+            "status": status,
+            "agent_command": record.agent_command,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "pid": record.pid,
+            "history_len": record.history.len(),
+        }));
+    }
+    println!("{}", serde_json::to_string_pretty(&sessions)?);
+    Ok(())
+}
+
+fn run_sessions_cleanup(paths: &SessionPaths, args: CleanupArgs) -> Result<()> {
+    let max_session_age = args.max_session_age_days.unwrap_or(CLEANUP_MAX_SESSION_AGE_DAYS);
+    let max_log_age = args.max_log_age_days.unwrap_or(CLEANUP_MAX_LOG_AGE_DAYS);
+    let max_log_size = args.max_log_size_mb.map(|mb| mb * 1024 * 1024).unwrap_or(CLEANUP_MAX_LOG_SIZE);
+    let dry_run = !args.force;
+    let now = SystemTime::now();
+
+    if dry_run {
+        eprintln!("dry-run mode (use --force to apply changes)");
+    }
+
+    let mut cleaned = 0u32;
+
+    // 1. Reap dead daemons — mark stale sessions as closed, remove orphan sockets
+    if let Ok(entries) = fs::read_dir(&paths.sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(mut record) = load_record(&path) else { continue };
+            if record.closed {
+                continue;
+            }
+            let pid_alive = record.pid.map(|p| process_alive(p)).unwrap_or(false);
+            if pid_alive {
+                continue;
+            }
+            // Daemon is dead but session not marked closed
+            eprintln!("reap: {} (pid={:?}, daemon dead)", record.name, record.pid);
+            if !dry_run {
+                record.closed = true;
+                record.updated_at = iso_now();
+                save_record(&path, &record)?;
+                let sock = Path::new(&record.socket_path);
+                if sock.exists() {
+                    let _ = fs::remove_file(sock);
+                }
+            }
+            cleaned += 1;
+        }
+    }
+
+    // 2. Prune old closed session records
+    if let Ok(entries) = fs::read_dir(&paths.sessions_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(record) = load_record(&path) else { continue };
+            if !record.closed {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(&path) else { continue };
+            let Ok(modified) = metadata.modified() else { continue };
+            let age = now.duration_since(modified).unwrap_or_default();
+            let age_days = age.as_secs() / 86400;
+            if age_days >= max_session_age {
+                eprintln!("prune: session record {} ({}d old)", record.name, age_days);
+                if !dry_run {
+                    let _ = fs::remove_file(&path);
+                }
+                cleaned += 1;
+            }
+        }
+    }
+
+    // 3. Truncate oversized log files
+    if let Ok(entries) = fs::read_dir(&paths.logs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(&path) else { continue };
+            let size = metadata.len();
+            if size > max_log_size {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                eprintln!("truncate: {} ({}MB > {}MB)", name, size / (1024 * 1024), max_log_size / (1024 * 1024));
+                if !dry_run {
+                    truncate_log_tail(&path, CLEANUP_LOG_TAIL_KEEP)?;
+                }
+                cleaned += 1;
+            }
+        }
+    }
+
+    // 4. Delete old log files for closed/missing sessions
+    if let Ok(entries) = fs::read_dir(&paths.logs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+                continue;
+            }
+            let Ok(metadata) = fs::metadata(&path) else { continue };
+            let Ok(modified) = metadata.modified() else { continue };
+            let age = now.duration_since(modified).unwrap_or_default();
+            let age_days = age.as_secs() / 86400;
+            if age_days < max_log_age {
+                continue;
+            }
+            // Check if there's a matching active session
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let record_path = paths.sessions_dir.join(format!("{stem}.json"));
+            if let Ok(record) = load_record(&record_path) {
+                if !record.closed {
+                    continue; // session still active, keep the log
+                }
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            eprintln!("delete: log {} ({}d old)", name, age_days);
+            if !dry_run {
+                let _ = fs::remove_file(&path);
+            }
+            cleaned += 1;
+        }
+    }
+
+    // 5. Remove orphan sockets (no matching session record, or session closed)
+    if let Ok(entries) = fs::read_dir(&paths.sockets_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+                continue;
+            }
+            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+            let record_path = paths.sessions_dir.join(format!("{stem}.json"));
+            let remove = if let Ok(record) = load_record(&record_path) {
+                record.closed
+            } else {
+                true // no record at all
+            };
+            if remove {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                eprintln!("remove: orphan socket {}", name);
+                if !dry_run {
+                    let _ = fs::remove_file(&path);
+                }
+                cleaned += 1;
+            }
+        }
+    }
+
+    eprintln!("{} items {}", cleaned, if dry_run { "would be cleaned" } else { "cleaned" });
+    Ok(())
+}
+
+/// Keep only the last `keep_bytes` of a log file.
+fn truncate_log_tail(path: &Path, keep_bytes: u64) -> Result<()> {
+    let content = fs::read(path)?;
+    let start = if content.len() as u64 > keep_bytes {
+        content.len() - keep_bytes as usize
+    } else {
+        0
+    };
+    fs::write(path, &content[start..])?;
+    Ok(())
+}
+
 fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
     let paths = SessionPaths::new(home);
     paths.ensure_dirs()?;
@@ -844,11 +1082,43 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
     record.updated_at = iso_now();
     save_record(record_path, &record)?;
 
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(stream) => stream,
+    // Use non-blocking accept with idle timeout so daemon self-terminates
+    // when no requests arrive for DAEMON_IDLE_TIMEOUT_SECS.
+    listener.set_nonblocking(true)?;
+    let idle_timeout = Duration::from_secs(DAEMON_IDLE_TIMEOUT_SECS);
+    let mut last_activity = std::time::Instant::now();
+
+    loop {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => {
+                last_activity = std::time::Instant::now();
+                stream
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if last_activity.elapsed() >= idle_timeout {
+                    eprintln!("idle timeout ({DAEMON_IDLE_TIMEOUT_SECS}s), daemon exiting");
+                    let mut record = load_record(record_path)?;
+                    record.closed = true;
+                    record.updated_at = iso_now();
+                    save_record(record_path, &record)?;
+                    break;
+                }
+                // Also check if agent process died while idle
+                if client.is_agent_dead() {
+                    eprintln!("agent died while idle, daemon exiting");
+                    let mut record = load_record(record_path)?;
+                    record.closed = true;
+                    record.updated_at = iso_now();
+                    save_record(record_path, &record)?;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
             Err(error) => return Err(error.into()),
         };
+        // Process request on the accepted stream (blocking per-connection)
+        let mut stream = stream;
         let mut reader = BufReader::new(stream.try_clone()?);
         let Some(request) = read_line_json::<OwnerRequest, _>(&mut reader)? else {
             continue;
