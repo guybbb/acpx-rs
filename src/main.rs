@@ -186,6 +186,49 @@ enum OwnerEvent {
     Error { message: String },
 }
 
+/// ACP-aligned output events matching the AcpRuntimeEvent TypeScript type.
+/// Used for --json stdout output so the TS runtime can consume events directly.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum AcpEvent {
+    TextDelta {
+        text: String,
+        stream: &'static str,
+        tag: &'static str,
+    },
+    Done {
+        #[serde(rename = "stopReason")]
+        stop_reason: String,
+    },
+    Error {
+        message: String,
+    },
+}
+
+impl From<&OwnerEvent> for Option<AcpEvent> {
+    fn from(event: &OwnerEvent) -> Self {
+        match event {
+            OwnerEvent::Chunk { text } => Some(AcpEvent::TextDelta {
+                text: text.clone(),
+                stream: "output",
+                tag: "agent_message_chunk",
+            }),
+            OwnerEvent::Thought { text } => Some(AcpEvent::TextDelta {
+                text: text.clone(),
+                stream: "thought",
+                tag: "agent_thought_chunk",
+            }),
+            OwnerEvent::Done { stop_reason, .. } => Some(AcpEvent::Done {
+                stop_reason: stop_reason.clone(),
+            }),
+            OwnerEvent::Error { message } => Some(AcpEvent::Error {
+                message: message.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 struct SessionPaths {
     root: PathBuf,
     sessions_dir: PathBuf,
@@ -797,8 +840,10 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
             break;
         };
         if json_mode {
-            println!("{}", serde_json::to_string(&event)?);
-            std::io::stdout().flush()?;
+            if let Some(acp_event) = Option::<AcpEvent>::from(&event) {
+                println!("{}", serde_json::to_string(&acp_event)?);
+                std::io::stdout().flush()?;
+            }
             match event {
                 OwnerEvent::Done { .. } => return Ok(()),
                 OwnerEvent::Error { message } => bail!("{message}"),
