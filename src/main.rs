@@ -8,6 +8,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,6 +46,8 @@ enum Commands {
     Sessions(SessionsCommand),
     #[command(hide = true, name = "__serve-session")]
     ServeSession(ServeSessionArgs),
+    #[command(hide = true, name = "__guard-session")]
+    GuardSession(ServeSessionArgs),
 }
 
 #[derive(Args, Debug)]
@@ -159,6 +162,9 @@ struct SessionRecord {
     config_model: Option<String>,
     #[serde(default)]
     config_mode: Option<String>,
+    /// Set by the guardian when the daemon exits without cleanly marking itself closed.
+    #[serde(default)]
+    death_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -697,6 +703,7 @@ fn run() -> Result<()> {
             SessionsCommand::Cleanup(args) => run_sessions_cleanup(&paths, args),
         },
         Commands::ServeSession(args) => run_session_daemon(&cli.home, &args.record),
+        Commands::GuardSession(args) => run_session_guardian(&cli.home, &args.record),
     }
 }
 
@@ -712,8 +719,16 @@ fn run_sessions_ensure(paths: &SessionPaths, args: EnsureArgs) -> Result<()> {
                 print_record(old)?;
                 return Ok(());
             }
-            // Clean up stale socket if PID is dead
+            // Daemon is dead — mark the old record closed before we overwrite it,
+            // so the death_reason is preserved in case the caller wants to query it.
             if !pid_alive {
+                let mut stale = old.clone();
+                if stale.death_reason.is_none() {
+                    stale.death_reason = Some("daemon found dead during session ensure".to_string());
+                }
+                stale.closed = true;
+                stale.updated_at = iso_now();
+                let _ = save_record(&record_path, &stale);
                 let _ = fs::remove_file(&old.socket_path);
             }
         }
@@ -739,6 +754,7 @@ fn run_sessions_ensure(paths: &SessionPaths, args: EnsureArgs) -> Result<()> {
         history,
         config_model: args.model,
         config_mode: args.mode,
+        death_reason: None,
     };
     save_record(&record_path, &record)?;
 
@@ -754,13 +770,24 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
     let record = load_record(&record_path)
         .with_context(|| format!("session '{}' does not exist; run sessions ensure", args.session))?;
     if record.closed {
-        bail!("session '{}' is closed", args.session);
+        let base = format!("session '{}' is closed", args.session);
+        let msg = match &record.death_reason {
+            Some(reason) => format!("{base}: {reason}"),
+            None => base,
+        };
+        bail!("{msg}");
     }
 
     let text = args.text.join(" ");
     let request = OwnerRequest::Prompt { text };
-    let mut stream = UnixStream::connect(&record.socket_path)
-        .with_context(|| format!("failed to connect to {}", record.socket_path))?;
+    let mut stream = UnixStream::connect(&record.socket_path).with_context(|| {
+        // Reload the record in case the guardian just wrote a death_reason
+        let death = load_record(&record_path)
+            .ok()
+            .and_then(|r| r.death_reason)
+            .unwrap_or_else(|| "daemon not reachable".to_string());
+        format!("session '{}' is not running: {}", args.session, death)
+    })?;
     write_line_json(&mut stream, &request)?;
 
     let mut reader = BufReader::new(stream);
@@ -849,7 +876,7 @@ fn run_sessions_list(paths: &SessionPaths, args: ListArgs) -> Result<()> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(record) = load_record(&path) else { continue };
+        let Ok(mut record) = load_record(&path) else { continue };
         if args.active && record.closed {
             continue;
         }
@@ -860,6 +887,18 @@ fn run_sessions_list(paths: &SessionPaths, args: ListArgs) -> Result<()> {
         } else if pid_alive && sock_alive {
             "running"
         } else {
+            // Daemon is gone but record wasn't closed (guardian may not have run yet,
+            // e.g. SIGKILL to the whole process group). Mark it closed inline.
+            if !record.closed && record.pid.is_some() && !pid_alive && !sock_alive {
+                let reason = record
+                    .death_reason
+                    .clone()
+                    .unwrap_or_else(|| "daemon found dead during list".to_string());
+                record.closed = true;
+                record.death_reason = Some(reason);
+                record.updated_at = iso_now();
+                let _ = save_record(&path, &record);
+            }
             "stale"
         };
         sessions.push(json!({
@@ -870,6 +909,7 @@ fn run_sessions_list(paths: &SessionPaths, args: ListArgs) -> Result<()> {
             "updated_at": record.updated_at,
             "pid": record.pid,
             "history_len": record.history.len(),
+            "death_reason": record.death_reason,
         }));
     }
     println!("{}", serde_json::to_string_pretty(&sessions)?);
@@ -1088,6 +1128,12 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
     let idle_timeout = Duration::from_secs(DAEMON_IDLE_TIMEOUT_SECS);
     let mut last_activity = std::time::Instant::now();
 
+    // Register signal handler: SIGTERM and SIGHUP both trigger a clean shutdown
+    // so the guardian (or readers of the record) know we exited intentionally.
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown_flag))?;
+    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&shutdown_flag))?;
+
     loop {
         let stream = match listener.accept() {
             Ok((stream, _)) => {
@@ -1095,6 +1141,15 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
                 stream
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Clean exit on SIGTERM / SIGHUP
+                if shutdown_flag.load(Ordering::Relaxed) {
+                    eprintln!("received shutdown signal, daemon exiting cleanly");
+                    let mut record = load_record(record_path)?;
+                    record.closed = true;
+                    record.updated_at = iso_now();
+                    save_record(record_path, &record)?;
+                    break;
+                }
                 if last_activity.elapsed() >= idle_timeout {
                     eprintln!("idle timeout ({DAEMON_IDLE_TIMEOUT_SECS}s), daemon exiting");
                     let mut record = load_record(record_path)?;
@@ -1211,12 +1266,55 @@ fn append_history(record_path: &Path, role: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Guardian process: spawns the real daemon as a child and waits for it.
+/// If the daemon exits without marking the session closed (crash, SIGKILL, OOM),
+/// the guardian writes the death reason into the record so callers know what happened.
+fn run_session_guardian(home: &Path, record_path: &Path) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut child = Command::new(&exe)
+        .args([
+            "--home",
+            &home.to_string_lossy(),
+            "__serve-session",
+            "--record",
+            &record_path.to_string_lossy(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("guardian: failed to spawn daemon")?;
+
+    let status = child.wait().context("guardian: waitpid failed")?;
+
+    // If the daemon exited without marking the session closed it died unexpectedly.
+    if let Ok(mut record) = load_record(record_path) {
+        if !record.closed {
+            let reason = match status.code() {
+                Some(code) => format!("daemon exited unexpectedly (exit code {code})"),
+                None => "daemon killed by signal".to_string(),
+            };
+            eprintln!("guardian: {reason} — marking session closed");
+            record.closed = true;
+            record.death_reason = Some(reason);
+            record.updated_at = iso_now();
+            let _ = save_record(record_path, &record);
+            // Remove the stale socket so future ensure/prompt don't try to connect
+            let sock = Path::new(&record.socket_path);
+            if sock.exists() {
+                let _ = fs::remove_file(sock);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn spawn_session_daemon(paths: &SessionPaths, record: &SessionRecord) -> Result<()> {
     let exe = std::env::current_exe()?;
     let record_path = paths.record_path(&record.name);
     let log_path = paths.log_path(&record.name);
     let command = format!(
-        "nohup {} --home {} __serve-session --record {} >> {} 2>&1 < /dev/null &",
+        "nohup {} --home {} __guard-session --record {} >> {} 2>&1 < /dev/null &",
         shell_escape(exe.as_os_str().to_string_lossy().as_ref()),
         shell_escape(paths.root.as_os_str().to_string_lossy().as_ref()),
         shell_escape(record_path.as_os_str().to_string_lossy().as_ref()),
