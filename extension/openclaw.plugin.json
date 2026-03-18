@@ -1,0 +1,53 @@
+{
+  "id": "acpx-rs",
+  "name": "ACPX-RS Runtime",
+  "description": "ACP runtime backend powered by the acpx-rs Rust broker.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "command": {
+        "type": "string",
+        "description": "Path to the acpx-rs binary"
+      },
+      "defaultModel": {
+        "type": "string",
+        "description": "Default model to use (e.g. gpt-5.4/high)"
+      },
+      "defaultMode": {
+        "type": "string",
+        "description": "Default agent mode (e.g. full-access)"
+      },
+      "startupTimeout": {
+        "type": "number",
+        "description": "Startup timeout in seconds (default: 60)"
+      },
+      "agents": {
+        "type": "object",
+        "description": "Agent name to command mapping",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "command": { "type": "string" },
+            "cwd": { "type": "string" },
+            "model": { "type": "string" },
+            "mode": { "type": "string" }
+          },
+          "required": ["command"]
+        }
+      }
+    }
+  },
+  "uiHints": {
+    "command": {
+      "label": "ACPX-RS Binary Path",
+      "help": "Absolute path to the acpx binary built from acpx-rs",
+      "placeholder": "/home/guy/repos/acpx-rs/target/release/acpx"
+    },
+    "agents": {
+      "label": "Agent Definitions",
+      "help": "Map of agent names to their launch commands",
+      "advanced": true
+    }
+  }
+}

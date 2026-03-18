@@ -1,0 +1,11 @@
+{
+  "name": "@openclaw/acpx-rs",
+  "version": "2026.3.13",
+  "description": "OpenClaw ACP runtime backend via acpx-rs (Rust broker)",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
