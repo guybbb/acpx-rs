@@ -76,12 +76,16 @@ cargo install --path .
 ## Command Surface
 
 ```text
-acpx prompt --session <SESSION> <TEXT...>
+acpx prompt --session <SESSION> [--json] [--file <PATH>] <TEXT...>
 acpx status --session <SESSION>
 acpx sessions ensure --name <NAME> --agent <COMMAND> [--cwd <DIR>] [--startup-timeout <SECS>] [--model <MODEL>] [--mode <MODE>]
 acpx sessions last <NAME>
 acpx sessions close <NAME>
+acpx sessions list [--active]
+acpx sessions cleanup [--max-session-age-days N] [--max-log-age-days N] [--max-log-size-mb N] [--force]
 ```
+
+The `--file` flag reads the prompt from a file (`--file -` for stdin), useful for long or multi-line prompts that are awkward as shell args.
 
 ## How It Works
 
@@ -111,38 +115,45 @@ The speedup comes from reusing a live ACP session instead of re-spawning and re-
 
 ## OpenClaw Integration
 
-acpx-rs can run as an OpenClaw ACP runtime backend via a plugin. This lets the OpenClaw agent spawn and manage ACP sessions (Codex, Gemini, Claude Code) through the gateway.
+acpx-rs ships with an OpenClaw plugin (in `extension/`) that registers it as an ACP runtime backend. This lets the OpenClaw agent dispatch tasks to ACP agents (Codex, Gemini, Claude Code) through the gateway.
 
-### Files
+The plugin includes a watchdog that polls session status every 30s when the event stream is quiet. If the session dies (agent crash, capacity error, etc.), the watchdog detects it and reports the actual error back to OpenClaw instead of hanging.
 
-| Component | Location |
-|-----------|----------|
-| Plugin source | `~/repos/openclaw/extensions/acpx-rs/` |
-| Plugin deploy | `~/.openclaw/extensions/acpx-rs/` (global extensions dir, survives npm updates) |
-| Skill | `~/.openclaw/workspace/skills/acpx-rs/SKILL.md` |
-| Binary (system) | `/usr/local/bin/acpx-rs` |
-| Binary (skill-local) | `~/.openclaw/workspace/skills/acpx-rs/acpx-rs` |
+### Layout
 
-### Install / Update
+```text
+acpx-rs/
+  src/main.rs              # Rust CLI + daemon
+  extension/               # OpenClaw plugin (TypeScript)
+    index.ts               # Plugin entry point
+    openclaw.plugin.json   # Plugin manifest + config schema
+    package.json
+    src/
+      runtime.ts           # AcpRuntime implementation (spawns CLI, streams events)
+      service.ts           # Plugin service registration
+```
 
-Build and deploy the binary:
+When deployed, the plugin lives in the openclaw user's global extensions dir so it survives `openclaw update`:
+
+| Component | Deploy location |
+|-----------|----------------|
+| Binary | `/usr/local/bin/acpx-rs` |
+| Plugin | `~openclaw/.openclaw/extensions/acpx-rs/` |
+
+### Deploy
+
+Build the binary and copy the plugin:
 
 ```bash
 cd ~/repos/acpx-rs
 cargo build --release
 sudo cp target/release/acpx /usr/local/bin/acpx-rs
-sudo cp target/release/acpx ~/.openclaw/workspace/skills/acpx-rs/acpx-rs
-sudo chown openclaw:openclaw ~/.openclaw/workspace/skills/acpx-rs/acpx-rs
 ```
 
-Deploy the plugin (run once, or after plugin source changes):
+Deploy the plugin (run after cloning, or after any TypeScript change):
 
 ```bash
-sudo mkdir -p /home/openclaw/.openclaw/extensions/acpx-rs/src
-sudo cp ~/repos/openclaw/extensions/acpx-rs/{package.json,index.ts,openclaw.plugin.json} \
-  /home/openclaw/.openclaw/extensions/acpx-rs/
-sudo cp ~/repos/openclaw/extensions/acpx-rs/src/{runtime.ts,service.ts} \
-  /home/openclaw/.openclaw/extensions/acpx-rs/src/
+sudo cp -r extension/* /home/openclaw/.openclaw/extensions/acpx-rs/
 sudo chown -R openclaw:openclaw /home/openclaw/.openclaw/extensions/acpx-rs/
 ```
 
@@ -188,7 +199,10 @@ Key: Gemini's ACP adapter uses `--experimental-acp` (not `--acp`), and does not 
 ### Resilience
 
 - **Dead agent detection**: The daemon polls with `recv_timeout(5s)` + `try_wait()` to detect crashed agents, even when child processes keep stdout open.
-- **Stderr capture**: Agent stderr is logged to the session log as `[agent:stderr]` lines and the last 50 lines are included in error messages for crash diagnostics.
+- **Write-error detection**: The streaming callback tracks broken-pipe errors. If the client disconnects mid-turn, the daemon bails with a clear error instead of silently losing the Done event.
+- **Error preservation**: Agent errors (e.g. "No capacity available for model") are saved to session history and `death_reason` so they are visible in `acpx status` and session records.
+- **Stderr capture**: Agent stderr is logged to the session log as `[agent:stderr]` lines and the last 50 lines are included in error messages for crash diagnostics. The TS runtime also captures CLI stderr for the same reason.
+- **Watchdog (TS runtime)**: If no events arrive for 30s, the plugin polls `acpx status` to check if the session died. If closed/unreachable, it kills the child and reports the actual `death_reason` instead of hanging.
 - **Auto-exit on death**: When the agent dies during a prompt, the daemon marks the session closed and exits. The next `sessions ensure` recreates everything from scratch.
 - **Non-fatal config**: `set_config_option` and `set_mode` failures are warnings, not fatal — agents that don't support them (e.g. Gemini) still work.
 
