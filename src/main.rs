@@ -3,12 +3,13 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read as IoRead, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -58,7 +59,11 @@ struct PromptArgs {
     #[arg(long)]
     json: bool,
 
-    #[arg(trailing_var_arg = true, required = true)]
+    /// Read prompt from a file (use "-" for stdin)
+    #[arg(long)]
+    file: Option<String>,
+
+    #[arg(trailing_var_arg = true)]
     text: Vec<String>,
 }
 
@@ -181,6 +186,7 @@ enum OwnerEvent {
     Status { record: SessionRecord },
     Chunk { text: String },
     Thought { text: String },
+    ToolCall { title: String, status: String, tool_call_id: String },
     Done { stop_reason: String, text: String },
     Closed,
     Error { message: String },
@@ -479,6 +485,31 @@ impl AcpClient {
                     .and_then(|u| u.get("sessionUpdate"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                match update_type {
+                    "tool_call" | "tool_call_update" => {
+                        let content = update.and_then(|u| u.get("content"));
+                        let title = content
+                            .and_then(|c| c.get("title"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let status = content
+                            .and_then(|c| c.get("status"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let tool_call_id = content
+                            .and_then(|c| c.get("toolCallId"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        if !title.is_empty() {
+                            on_event(OwnerEvent::ToolCall { title, status, tool_call_id });
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 let text = update
                     .and_then(|u| u.get("content"))
                     .and_then(|c| c.get("text"))
@@ -821,7 +852,21 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
         bail!("{msg}");
     }
 
-    let text = args.text.join(" ");
+    let text = match args.file.as_deref() {
+        Some("-") => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+        Some(path) => fs::read_to_string(path)
+            .with_context(|| format!("failed to read prompt file: {path}"))?,
+        None => {
+            if args.text.is_empty() {
+                bail!("no prompt text provided; use trailing args or --file");
+            }
+            args.text.join(" ")
+        }
+    };
     let request = OwnerRequest::Prompt { text };
     let mut stream = UnixStream::connect(&record.socket_path).with_context(|| {
         // Reload the record in case the guardian just wrote a death_reason
@@ -857,6 +902,10 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
                 }
                 OwnerEvent::Thought { text } => {
                     eprint!("\x1b[2m[thinking] {text}\x1b[0m");
+                    std::io::stderr().flush()?;
+                }
+                OwnerEvent::ToolCall { title, status, .. } => {
+                    eprint!("\x1b[2m[tool: {title}] {status}\x1b[0m\n");
                     std::io::stderr().flush()?;
                 }
                 OwnerEvent::Done { text, .. } => {
@@ -1274,9 +1323,20 @@ fn handle_prompt(
     stream: &mut UnixStream,
 ) -> Result<()> {
     append_history(record_path, "user", text)?;
+    // Track the first write failure so we can bail after prompt() returns.
+    // Cell is used because the closure already borrows `stream` mutably;
+    // Cell<bool> avoids a second &mut borrow.
+    let write_failed = Cell::new(false);
     let response = client.prompt(session_id, text, |event| {
-        let _ = write_line_json(stream, &event);
+        if !write_failed.get() {
+            if write_line_json(stream, &event).is_err() {
+                write_failed.set(true);
+            }
+        }
     })?;
+    if write_failed.get() {
+        bail!("failed to write event to client (broken pipe)");
+    }
     let assistant = if response.is_empty() {
         "".to_string()
     } else {
