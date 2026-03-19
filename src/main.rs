@@ -1287,6 +1287,8 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
                             message: msg.clone(),
                         },
                     );
+                    // Record the error in history so it's visible in session records
+                    let _ = append_history(record_path, "error", &msg);
                     // If the agent process is dead, exit the daemon so that
                     // `sessions ensure` will detect the stale socket and
                     // recreate everything from scratch.
@@ -1294,6 +1296,7 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
                         eprintln!("agent is dead, daemon exiting: {msg}");
                         let mut record = load_record(record_path)?;
                         record.closed = true;
+                        record.death_reason = Some(msg);
                         record.updated_at = iso_now();
                         save_record(record_path, &record)?;
                         break;
