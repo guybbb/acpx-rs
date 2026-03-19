@@ -142,11 +142,48 @@ export class AcpxRsRuntime implements AcpRuntime {
       });
     }
 
+    // Capture stderr so agent/CLI errors are not lost
+    let stderrBuf = "";
+    child.stderr?.on("data", (data: Buffer) => {
+      stderrBuf += data.toString();
+      if (stderrBuf.length > 4096) {
+        stderrBuf = stderrBuf.slice(-4096);
+      }
+    });
+
+    // Watchdog: if no events for WATCHDOG_INTERVAL_MS, poll session status.
+    // If the session is closed/dead, kill the child so the readline loop ends
+    // and we can report the actual error instead of hanging.
+    const WATCHDOG_INTERVAL_MS = 30_000;
+    let lastEventAt = Date.now();
+    let watchdogReason: string | null = null;
+    let watchdogRunning = false;
+    const watchdog = setInterval(async () => {
+      if (watchdogRunning) return;
+      if (Date.now() - lastEventAt < WATCHDOG_INTERVAL_MS) return;
+      watchdogRunning = true;
+      try {
+        const output = await this.exec(["status", "-s", state.sessionName]);
+        const record = JSON.parse(output) as Record<string, unknown>;
+        if (record.closed) {
+          watchdogReason =
+            (record.death_reason as string) || "session closed (detected by watchdog)";
+          child.kill("SIGTERM");
+        }
+      } catch {
+        watchdogReason = "session unreachable (detected by watchdog)";
+        child.kill("SIGTERM");
+      } finally {
+        watchdogRunning = false;
+      }
+    }, WATCHDOG_INTERVAL_MS);
+
     const rl = createInterface({ input: child.stdout });
     let hadError: string | null = null;
 
     try {
       for await (const line of rl) {
+        lastEventAt = Date.now();
         const trimmed = line.trim();
         if (!trimmed) continue;
 
@@ -170,12 +207,17 @@ export class AcpxRsRuntime implements AcpRuntime {
 
       // If we get here without done/error, the process ended unexpectedly
       if (!hadError) {
+        const detail = watchdogReason || stderrBuf.trim();
+        const message = detail
+          ? `acpx-rs failed: ${detail.slice(0, 500)}`
+          : "acpx-rs process ended without a done event";
         yield {
           type: "error",
-          message: "acpx-rs process ended without a done event",
+          message,
         };
       }
     } finally {
+      clearInterval(watchdog);
       rl.close();
       child.kill("SIGTERM");
     }
