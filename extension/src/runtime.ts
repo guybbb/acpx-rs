@@ -151,6 +151,21 @@ export class AcpxRsRuntime implements AcpRuntime {
       }
     });
 
+    // Heartbeat: emit a lightweight status event when no events have been
+    // forwarded for HEARTBEAT_INTERVAL_MS so ACP knows the task is alive.
+    const HEARTBEAT_INTERVAL_MS = 15_000;
+    let lastYieldAt = Date.now();
+    const pendingHeartbeats: AcpRuntimeEvent[] = [];
+    const heartbeat = setInterval(() => {
+      if (Date.now() - lastYieldAt >= HEARTBEAT_INTERVAL_MS) {
+        pendingHeartbeats.push({
+          type: "status",
+          text: "working…",
+          tag: "usage_update",
+        } as AcpRuntimeEvent);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+
     // Watchdog: if no events for WATCHDOG_INTERVAL_MS, poll session status.
     // If the session is closed/dead, kill the child so the readline loop ends
     // and we can report the actual error instead of hanging.
@@ -184,6 +199,12 @@ export class AcpxRsRuntime implements AcpRuntime {
     try {
       for await (const line of rl) {
         lastEventAt = Date.now();
+
+        // Flush any pending heartbeats before the real event
+        while (pendingHeartbeats.length > 0) {
+          yield pendingHeartbeats.shift()!;
+        }
+
         const trimmed = line.trim();
         if (!trimmed) continue;
 
@@ -198,10 +219,15 @@ export class AcpxRsRuntime implements AcpRuntime {
 
         if (type === "text_delta" || type === "done" || type === "error") {
           if (type === "error") hadError = event.message as string;
+          lastYieldAt = Date.now();
           yield event as AcpRuntimeEvent;
           if (type === "done" || type === "error") return;
         } else if (type === "status") {
-          yield { type: "status", text: JSON.stringify(event) };
+          lastYieldAt = Date.now();
+          yield {
+            type: "status",
+            text: (event.text as string) ?? JSON.stringify(event),
+          } as AcpRuntimeEvent;
         }
       }
 
@@ -217,6 +243,7 @@ export class AcpxRsRuntime implements AcpRuntime {
         };
       }
     } finally {
+      clearInterval(heartbeat);
       clearInterval(watchdog);
       rl.close();
       child.kill("SIGTERM");
