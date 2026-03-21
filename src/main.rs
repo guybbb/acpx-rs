@@ -403,6 +403,16 @@ impl AcpClient {
             .unwrap_or_default()
     }
 
+}
+
+struct SessionInfo {
+    session_id: String,
+    available_modes: Vec<String>,
+    current_mode: Option<String>,
+    current_model: Option<String>,
+}
+
+impl AcpClient {
     fn initialize(&mut self) -> Result<()> {
         let result = self.request(
             "initialize",
@@ -426,7 +436,7 @@ impl AcpClient {
         Ok(())
     }
 
-    fn new_session(&mut self, cwd: &Path) -> Result<String> {
+    fn new_session(&mut self, cwd: &Path) -> Result<SessionInfo> {
         let result = self.request(
             "session/new",
             json!({
@@ -435,11 +445,42 @@ impl AcpClient {
             }),
             None::<fn(&Value)>,
         )?;
-        result
+        let session_id = result
             .get("sessionId")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .context("session/new did not return sessionId")
+            .context("session/new did not return sessionId")?;
+
+        // Extract available modes
+        let available_modes: Vec<String> = result
+            .pointer("/modes/availableModes")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("id").and_then(Value::as_str).map(ToOwned::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let current_mode = result
+            .pointer("/modes/currentModeId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        // Extract current model
+        let current_model = result
+            .pointer("/models/currentModelId")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        // Check if agent supports set_config_option (from initialize capabilities)
+        // We detect this at set_config_option call time instead — keep it simple.
+
+        Ok(SessionInfo {
+            session_id,
+            available_modes,
+            current_mode,
+            current_model,
+        })
     }
 
     fn set_config_option(&mut self, session_id: &str, config_id: &str, value: &str) -> Result<()> {
@@ -1232,27 +1273,46 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
 
     let cwd = PathBuf::from(&record.cwd);
     let mut client = AcpClient::start(&record.agent_command, &cwd, paths.log_path(&record.name))?;
-    let session_id = client.new_session(&cwd)?;
+    let info = client.new_session(&cwd)?;
+    let session_id = info.session_id;
 
     // Apply config after session creation (required by some agents like Codex).
-    // Non-fatal: some agents (e.g. Gemini) don't support set_config_option/set_mode.
+    // Skip set_mode if the requested mode isn't in the agent's available modes list,
+    // or if the agent is already in the requested mode.
     if let Some(ref mode) = record.config_mode {
-        if let Err(e) = client.set_mode(&session_id, mode) {
+        let already_set = info.current_mode.as_deref() == Some(mode.as_str());
+        let mode_available = info.available_modes.is_empty()
+            || info.available_modes.iter().any(|m| m == mode);
+        if already_set {
+            eprintln!("info: mode \"{mode}\" already active, skipping set_mode");
+        } else if !mode_available {
+            eprintln!(
+                "info: mode \"{mode}\" not in agent's available modes {:?}, skipping set_mode (current: {:?})",
+                info.available_modes,
+                info.current_mode,
+            );
+        } else if let Err(e) = client.set_mode(&session_id, mode) {
             eprintln!("warning: set_mode failed (agent may not support it): {e:#}");
         }
     }
+    // Skip set_config_option for model if it's already the current model.
     if let Some(ref model) = record.config_model {
-        // Split composite model IDs like "gpt-5.4/high" into model + reasoning_effort
-        if let Some((base, effort)) = model.split_once('/') {
-            if let Err(e) = client.set_config_option(&session_id, "model", base) {
-                eprintln!("warning: set_config_option(model) failed: {e:#}");
-            }
-            if let Err(e) = client.set_config_option(&session_id, "reasoning_effort", effort) {
-                eprintln!("warning: set_config_option(reasoning_effort) failed: {e:#}");
-            }
+        let already_set = info.current_model.as_deref() == Some(model.as_str());
+        if already_set {
+            eprintln!("info: model \"{model}\" already active, skipping set_config_option");
         } else {
-            if let Err(e) = client.set_config_option(&session_id, "model", model) {
-                eprintln!("warning: set_config_option(model) failed: {e:#}");
+            // Split composite model IDs like "gpt-5.4/high" into model + reasoning_effort
+            if let Some((base, effort)) = model.split_once('/') {
+                if let Err(e) = client.set_config_option(&session_id, "model", base) {
+                    eprintln!("warning: set_config_option(model) failed: {e:#}");
+                }
+                if let Err(e) = client.set_config_option(&session_id, "reasoning_effort", effort) {
+                    eprintln!("warning: set_config_option(reasoning_effort) failed: {e:#}");
+                }
+            } else {
+                if let Err(e) = client.set_config_option(&session_id, "model", model) {
+                    eprintln!("warning: set_config_option(model) failed: {e:#}");
+                }
             }
         }
     }
