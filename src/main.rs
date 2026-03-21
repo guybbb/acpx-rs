@@ -202,6 +202,9 @@ enum AcpEvent {
         stream: &'static str,
         tag: &'static str,
     },
+    Status {
+        text: String,
+    },
     Done {
         #[serde(rename = "stopReason")]
         stop_reason: String,
@@ -227,6 +230,17 @@ impl From<&OwnerEvent> for Option<AcpEvent> {
             OwnerEvent::Done { stop_reason, .. } => Some(AcpEvent::Done {
                 stop_reason: stop_reason.clone(),
             }),
+            OwnerEvent::ToolCall { title, status, .. } => {
+                // Only emit a brief status on start — skip updates/completions to
+                // keep the calling agent's context lean.
+                if status == "in_progress" {
+                    Some(AcpEvent::Status {
+                        text: format!("using {title}"),
+                    })
+                } else {
+                    None
+                }
+            }
             OwnerEvent::Error { message } => Some(AcpEvent::Error {
                 message: message.clone(),
             }),
