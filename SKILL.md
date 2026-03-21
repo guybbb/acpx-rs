@@ -64,6 +64,11 @@ Default for Codex: `--model "gpt-5.4/high"` `--mode "auto"`
 
 ## Command templates
 
+> **CRITICAL: always use two separate exec calls for ensure + prompt.**
+> Never chain them with `&&` in a single exec — the ensure output (session JSON)
+> pollutes the prompt stream and the agent may mistake it for the prompt result.
+> If you must chain in one command, pass `--quiet` / `-q` to ensure.
+
 ### Create or reconnect session (idempotent)
 
 ```bash
@@ -76,17 +81,29 @@ ${ACPX_CMD} sessions ensure \
   --startup-timeout 30
 ```
 
+### Send prompt (plain text — use for relay to user)
+
+```bash
+${ACPX_CMD} prompt -s oc-<agent>-<conversationId> "<prompt text>"
+```
+
 ### Send prompt (JSON streaming — use for programmatic consumption)
 
 ```bash
 ${ACPX_CMD} prompt -s oc-<agent>-<conversationId> --json "<prompt text>"
 ```
 
-### Send prompt (plain text — use for relay to user)
+The `--json` stream emits lightweight status events (`"using <tool>"`, `"working…"` heartbeats)
+so you can relay progress to the user without waiting for the full response.
+
+### Fallback: chained command (only if two exec calls are impossible)
 
 ```bash
-${ACPX_CMD} prompt -s oc-<agent>-<conversationId> "<prompt text>"
+${ACPX_CMD} sessions ensure -q --name ... --agent ... && \
+${ACPX_CMD} prompt -s ... "<prompt text>"
 ```
+
+The `-q` flag suppresses ensure's JSON output so only the prompt stream reaches stdout.
 
 ### Check session status
 

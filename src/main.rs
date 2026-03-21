@@ -129,6 +129,10 @@ struct EnsureArgs {
 
     #[arg(long)]
     mode: Option<String>,
+
+    /// Suppress stdout output (useful when chaining with prompt --json)
+    #[arg(long, short = 'q')]
+    quiet: bool,
 }
 
 #[derive(Args, Debug)]
@@ -804,7 +808,9 @@ fn run_sessions_ensure(paths: &SessionPaths, args: EnsureArgs) -> Result<()> {
             // Check if daemon PID is still alive before trying socket
             let pid_alive = old.pid.map(|p| process_alive(p)).unwrap_or(false);
             if pid_alive && socket_alive(Path::new(&old.socket_path)) {
-                print_record(old)?;
+                if !args.quiet {
+                    print_record(old)?;
+                }
                 return Ok(());
             }
             // Daemon is dead — mark the old record closed before we overwrite it,
@@ -849,7 +855,9 @@ fn run_sessions_ensure(paths: &SessionPaths, args: EnsureArgs) -> Result<()> {
     spawn_session_daemon(paths, &record)?;
     let timeout = Duration::from_secs(args.startup_timeout);
     let record = wait_for_ready_record(&record_path, &socket_path, timeout)?;
-    print_record(&record)?;
+    if !args.quiet {
+        print_record(&record)?;
+    }
     Ok(())
 }
 
