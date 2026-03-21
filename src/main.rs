@@ -892,11 +892,36 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
     })?;
     write_line_json(&mut stream, &request)?;
 
+    // In JSON mode, set a read timeout so we can emit heartbeat status events
+    // when the agent is working silently (e.g. long tool runs).
+    let heartbeat_secs: u64 = 15;
+    if args.json {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(heartbeat_secs)))?;
+    }
+
     let mut reader = BufReader::new(stream);
     let json_mode = args.json;
+    let mut last_event = std::time::Instant::now();
     loop {
-        let Some(event) = read_line_json::<OwnerEvent, _>(&mut reader)? else {
-            break;
+        let event = match read_line_json::<OwnerEvent, _>(&mut reader) {
+            Err(e) if e.downcast_ref::<std::io::Error>()
+                .map_or(false, |io| io.kind() == std::io::ErrorKind::WouldBlock
+                    || io.kind() == std::io::ErrorKind::TimedOut) =>
+            {
+                if json_mode && last_event.elapsed().as_secs() >= heartbeat_secs {
+                    let hb = AcpEvent::Status { text: "working…".to_string() };
+                    println!("{}", serde_json::to_string(&hb)?);
+                    std::io::stdout().flush()?;
+                    last_event = std::time::Instant::now();
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+            Ok(None) => break,
+            Ok(Some(event)) => {
+                last_event = std::time::Instant::now();
+                event
+            }
         };
         if json_mode {
             if let Some(acp_event) = Option::<AcpEvent>::from(&event) {
