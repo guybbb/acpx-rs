@@ -63,6 +63,16 @@ struct PromptArgs {
     #[arg(long)]
     file: Option<String>,
 
+    /// Deliver result via openclaw message send instead of stdout.
+    /// Format: "channel:target[:thread_id]" e.g. "telegram:361509501:1346"
+    #[arg(long)]
+    callback: Option<String>,
+
+    /// Skip streaming; on completion ask the agent for a summary and print it to stdout.
+    /// Useful for subagent/script callers that only need the final result.
+    #[arg(long)]
+    summarize: bool,
+
     #[arg(trailing_var_arg = true)]
     text: Vec<String>,
 }
@@ -902,6 +912,110 @@ fn run_sessions_ensure(paths: &SessionPaths, args: EnsureArgs) -> Result<()> {
     Ok(())
 }
 
+/// Parse callback string "channel:target[:thread_id]"
+struct CallbackTarget {
+    channel: String,
+    target: String,
+    thread_id: Option<String>,
+}
+
+fn parse_callback(s: &str) -> Result<CallbackTarget> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        bail!("--callback format: channel:target[:thread_id]  (e.g. telegram:361509501:1346)");
+    }
+    Ok(CallbackTarget {
+        channel: parts[0].to_string(),
+        target: parts[1].to_string(),
+        thread_id: parts.get(2).map(|s| s.to_string()),
+    })
+}
+
+/// Deliver a message via `openclaw message send`, chunking if needed.
+/// Telegram limit is 4096 chars; we use 3900 to leave room for formatting.
+const MAX_MSG_LEN: usize = 3900;
+
+fn deliver_callback(cb: &CallbackTarget, message: &str) -> Result<()> {
+    let chunks = chunk_message(message, MAX_MSG_LEN);
+    for chunk in &chunks {
+        deliver_single(cb, chunk)?;
+        if chunks.len() > 1 {
+            // Small delay between chunks to avoid rate limits
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    Ok(())
+}
+
+fn chunk_message(message: &str, max_len: usize) -> Vec<String> {
+    if message.len() <= max_len {
+        return vec![message.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = message;
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining.to_string());
+            break;
+        }
+        // Try to split at a newline boundary
+        let split_at = remaining[..max_len]
+            .rfind('\n')
+            .unwrap_or(max_len);
+        let split_at = if split_at == 0 { max_len } else { split_at };
+        chunks.push(remaining[..split_at].to_string());
+        remaining = &remaining[split_at..].trim_start_matches('\n');
+    }
+    chunks
+}
+
+fn deliver_single(cb: &CallbackTarget, message: &str) -> Result<()> {
+    let mut cmd = std::process::Command::new("openclaw");
+    cmd.args(["message", "send", "--channel", &cb.channel, "--target", &cb.target, "--message", message]);
+    if let Some(ref tid) = cb.thread_id {
+        cmd.args(["--thread-id", tid]);
+    }
+    let output = cmd.output().context("failed to run openclaw message send")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("openclaw message send failed (exit {}): {}", output.status, stderr.trim());
+    }
+    Ok(())
+}
+
+/// After the main task completes, send a follow-up prompt asking the coding agent
+/// to summarize what it did. Returns the summary text.
+fn request_summary(socket_path: &str, session_name: &str) -> Result<String> {
+    let summary_prompt = "Summarize what you just did in a concise report (2-5 bullet points). \
+        Include: what was done, the outcome (success/failure), and any issues. \
+        Be specific about file names, URLs, or commands. No preamble, just the bullet points.";
+
+    let mut stream = UnixStream::connect(socket_path)
+        .with_context(|| format!("session '{}' not reachable for summary", session_name))?;
+    let request = OwnerRequest::Prompt { text: summary_prompt.to_string() };
+    write_line_json(&mut stream, &request)?;
+
+    let mut reader = BufReader::new(stream);
+    let mut summary = String::new();
+    loop {
+        match read_line_json::<OwnerEvent, _>(&mut reader)? {
+            None => break,
+            Some(OwnerEvent::Chunk { text }) => summary.push_str(&text),
+            Some(OwnerEvent::Done { text, .. }) => {
+                if summary.is_empty() {
+                    summary = text;
+                }
+                return Ok(summary);
+            }
+            Some(OwnerEvent::Error { message }) => {
+                return Err(anyhow::anyhow!("summary prompt failed: {message}"));
+            }
+            _ => {} // skip thoughts, tool calls
+        }
+    }
+    Ok(summary)
+}
+
 fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
     let record_path = paths.record_path(&args.session);
     let record = load_record(&record_path)
@@ -914,6 +1028,11 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
         };
         bail!("{msg}");
     }
+
+    let callback = match &args.callback {
+        Some(cb_str) => Some(parse_callback(cb_str)?),
+        None => None,
+    };
 
     let text = match args.file.as_deref() {
         Some("-") => {
@@ -930,6 +1049,18 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
             args.text.join(" ")
         }
     };
+
+    // In callback mode, print session info immediately so the caller has it.
+    if callback.is_some() {
+        let info = serde_json::json!({
+            "status": "started",
+            "session": &args.session,
+            "acp_session_id": &record.acp_session_id,
+        });
+        println!("{}", serde_json::to_string(&info)?);
+        std::io::stdout().flush()?;
+    }
+
     let request = OwnerRequest::Prompt { text };
     let mut stream = UnixStream::connect(&record.socket_path).with_context(|| {
         // Reload the record in case the guardian just wrote a death_reason
@@ -951,6 +1082,7 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let json_mode = args.json;
     let mut last_event = std::time::Instant::now();
+
     loop {
         let event = match read_line_json::<OwnerEvent, _>(&mut reader) {
             Err(e) if e.downcast_ref::<std::io::Error>()
@@ -972,7 +1104,61 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
                 event
             }
         };
-        if json_mode {
+
+        if callback.is_some() {
+            // Callback mode: on completion, ask the agent for a summary, then deliver.
+            match &event {
+                OwnerEvent::Done { .. } => {
+                    let cb = callback.as_ref().unwrap();
+                    let label = format!("**[{}]**\n", args.session);
+                    // Ask the coding agent to summarize what it did.
+                    let summary = request_summary(&record.socket_path, &args.session);
+                    let msg = match summary {
+                        Ok(text) if !text.is_empty() => format!("{label}{text}"),
+                        Ok(_) => format!("{label}(task completed, agent returned no summary)"),
+                        Err(e) => format!("{label}Task completed but summary failed: {e}"),
+                    };
+                    if let Err(e) = deliver_callback(cb, &msg) {
+                        eprintln!("callback delivery failed: {e:#}");
+                    }
+                    return Ok(());
+                }
+                OwnerEvent::Error { message } => {
+                    let cb = callback.as_ref().unwrap();
+                    let label = format!("**[{}]**\n", args.session);
+                    let msg = format!("{label}Error: {message}");
+                    if let Err(e) = deliver_callback(cb, &msg) {
+                        eprintln!("callback delivery failed: {e:#}");
+                    }
+                    bail!("{message}");
+                }
+                _ => {} // Skip chunks/thoughts/tool calls during main task
+            }
+        } else if args.summarize {
+            // Summarize mode: skip streaming, on Done get summary and print to stdout.
+            match &event {
+                OwnerEvent::Done { .. } => {
+                    let summary = request_summary(&record.socket_path, &args.session);
+                    match summary {
+                        Ok(text) if !text.is_empty() => {
+                            println!("{text}");
+                        }
+                        Ok(_) => {
+                            println!("(task completed, agent returned no summary)");
+                        }
+                        Err(e) => {
+                            eprintln!("summary request failed: {e}");
+                            println!("(task completed but summary failed)");
+                        }
+                    }
+                    return Ok(());
+                }
+                OwnerEvent::Error { message } => {
+                    bail!("{message}");
+                }
+                _ => {} // Skip chunks/thoughts/tool calls
+            }
+        } else if json_mode {
             if let Some(acp_event) = Option::<AcpEvent>::from(&event) {
                 println!("{}", serde_json::to_string(&acp_event)?);
                 std::io::stdout().flush()?;
@@ -1006,6 +1192,14 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
                 other => bail!("unexpected owner event: {}", serde_json::to_string(&other)?),
             }
         }
+    }
+
+    // If we reach here in callback mode without done/error, notify.
+    if let Some(ref cb) = callback {
+        let label = format!("**[{}]**\n", args.session);
+        let msg = format!("{label}Session ended unexpectedly (no final response).");
+        let _ = deliver_callback(cb, &msg);
+        return Ok(());
     }
 
     bail!("owner closed connection without a final response")

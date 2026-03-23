@@ -1,96 +1,83 @@
 ---
 name: acpx-rs
-description: ACP session broker backend. Use sessions_spawn (ACP runtime) to dispatch work to Codex, Claude Code, Gemini, Pi. Do NOT use exec for prompts — use sessions_spawn for deterministic delivery.
+description: ACP session broker. Dispatch work to Codex, Claude Code, or Gemini via sessions_spawn subagent. Results auto-announce back into your context.
 user-invocable: false
 ---
 
-# acpx-rs — Rust ACP Session Broker
+# acpx-rs — ACP Session Broker
 
-## How to use — ALWAYS use `sessions_spawn`
+## How to dispatch work
 
-**Do NOT use `exec` to run `acpx-rs prompt`.** Use `sessions_spawn` instead. The ACP runtime delivers results deterministically through the projector. The exec path is unreliable — the LLM may silently drop results and the user sees nothing.
+Use `sessions_spawn` with `runtime="subagent"` to dispatch work to a coding agent. The subagent runs acpx-rs, waits for the coding agent to finish, and the result is automatically announced back into your conversation context.
 
-To dispatch work to a coding agent:
+### sessions_spawn call
 
-```json
-{
-  "task": "<the work to perform>",
-  "runtime": "acp",
-  "agentId": "<agent>",
-  "thread": true,
-  "mode": "session"
-}
+```
+sessions_spawn(
+  task: "<see task template below>",
+  runtime: "subagent",
+  mode: "run",
+  label: "<agent>: <short description>"
+)
 ```
 
-**Always tell the user the session name** right after spawning so they can track it.
+### Task template
 
-## AgentId mapping
+The `task` parameter must include acpx-rs instructions so the subagent knows how to run the coding agent:
 
-- "codex" → `agentId: "codex"`
-- "claude" or "claude code" → `agentId: "claude"`
-- "gemini" or "gemini cli" → `agentId: "gemini"`
-- "pi" → `agentId: "pi"`
-- "investment" or "trading agent" → `agentId: "investment"`
+```
+Run the following task using <Agent> via acpx-rs:
 
-## Model and mode defaults
+Task: <user's task description>
 
-The acpx-rs plugin config defines defaults per agent. Do NOT pass model/mode overrides in `sessions_spawn` unless the user explicitly requests a specific model.
+Instructions:
+1. Run: exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name <session-name> --agent "<agent-command>" --startup-timeout 60 --quiet
+2. Run: exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s <session-name> --summarize "<user's task>"
+3. The prompt command will block until the agent finishes and print a summary. Report the summary as your final message.
 
-- **Codex**: plugin config sets `gpt-5.4-codex/high`, mode `auto`
-- **Gemini**: no model/mode override — Gemini auto-selects (`auto-gemini-3`) and runs in `yolo` mode
-- **Claude**: no model/mode override — Claude Code uses its own defaults
+If step 1 or 2 fails, report the error.
+```
 
-## Completion and error reporting
+## Agent commands and session names
 
-The ACP runtime delivers results automatically. After calling `sessions_spawn`:
+| Agent | Session prefix | Command |
+|-------|---------------|---------|
+| Gemini | `oc-gemini-` | `gemini --experimental-acp --yolo -m auto-gemini-3` |
+| Codex | `oc-codex-` | `npx -y @zed-industries/codex-acp` |
+| Claude | `oc-claude-` | `npx -y @zed-industries/claude-agent-acp` |
 
-1. The runtime creates/reuses the acpx-rs session
-2. Sends the prompt to the agent
-3. Streams events (status updates, text, done/error) back through the projector
-4. The projector delivers to the user's channel (Telegram, web, etc.)
+Use the conversation/thread ID as suffix for session naming (e.g., `oc-gemini-1346`).
 
-**You do not need to relay the response yourself.** The delivery is deterministic.
+## Example: Dispatch to Gemini
 
-If the spawn fails, report the error to the user immediately.
+```
+sessions_spawn(
+  task: "Run the following task using Gemini via acpx-rs:\n\nTask: check the deployment status\n\nInstructions:\n1. Run: exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name oc-gemini-1346 --agent \"gemini --experimental-acp --yolo -m auto-gemini-3\" --startup-timeout 60 --quiet\n2. Run: exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s oc-gemini-1346 --summarize \"check the deployment status\"\n3. The prompt command will block until the agent finishes and print a summary. Report the summary as your final message.\n\nIf step 1 or 2 fails, report the error.",
+  runtime: "subagent",
+  mode: "run",
+  label: "gemini: check deployment status"
+)
+```
 
-## Diagnostic commands (exec only — never for prompts)
+## After dispatching
 
-Use `exec` only for status checks, not for sending prompts:
+1. Tell the user: "Dispatched to `<agent>`. I'll report back when it's done."
+2. Continue handling other messages — the result will be announced back automatically.
+3. When the result arrives, deliver it to the user and answer any follow-up questions.
+
+## Diagnostic commands (exec)
 
 ```bash
-ACPX_CMD="~/.openclaw/workspace/skills/acpx-rs/acpx-rs"
-
-# Check session status
-${ACPX_CMD} status -s <session-name>
-
-# List active sessions
-${ACPX_CMD} sessions list --active
-
-# Get last assistant response
-${ACPX_CMD} sessions last <session-name>
-
-# Close a session
-${ACPX_CMD} sessions close <session-name>
+ACPX=~/.openclaw/workspace/skills/acpx-rs/acpx-rs
+${ACPX} status -s <session-name>
+${ACPX} sessions list --active
+${ACPX} sessions last <session-name>
+${ACPX} sessions close <session-name>
 ```
-
-## Session naming
-
-Sessions are named `oc-<agent>-<conversationId>` where:
-- `<agent>` = codex, claude, gemini, pi, etc.
-- `<conversationId>` = thread id when available, otherwise channel/conversation id
 
 ## Session lifecycle
 
-- **`sessions ensure` is idempotent** — safe to call repeatedly. Reuses alive sessions, recreates dead ones.
-- **Sessions persist across tasks** in the same project. The agent retains context.
-- **Auto-recovery**: if a session dies, the next `sessions ensure` rebuilds it transparently.
-- **Idle timeout**: daemons self-terminate after 30 minutes of inactivity.
-- **Do NOT close sessions** after each task. Keep them alive for follow-up work.
-
-## Troubleshooting
-
-- **Session not starting**: Check startup timeout (default 60s in plugin config)
-- **Model not applied**: Some agents (Gemini) don't support `set_config_option` — this is handled gracefully
-- **CLAUDECODE error**: The broker strips `CLAUDECODE` env var automatically
-- **Session died**: Run `sessions ensure` again — it auto-recovers
-- **Check logs**: `~/.acpx-rs/logs/<session-name>.log` for `[error]` and `[agent:stderr]`
+- `sessions ensure` is idempotent — reuses alive sessions, recreates dead ones
+- Sessions persist across tasks (agent retains context)
+- Idle timeout: 30 minutes
+- Do NOT close sessions after each task
