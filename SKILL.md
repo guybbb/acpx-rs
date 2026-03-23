@@ -29,10 +29,12 @@ The `task` parameter must include explicit acpx-rs instructions. The subagent is
 You are a worker subagent. You MUST complete ALL steps below sequentially. Do NOT say "dispatched" or stop early. Wait for each command to finish before running the next.
 
 Step 1 — Ensure session (WAIT for completion, do NOT background):
-exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name <session-name> --agent "<agent-command>" --startup-timeout 60 --quiet
+exec(command: "~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name <session-name> --agent \"<agent-command>\" --startup-timeout 60 --quiet", timeout: 120)
 
 Step 2 — Send prompt and wait for result (this may take several minutes — WAIT for it):
-exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s <session-name> --summarize "<user's task>"
+exec(command: "~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s <session-name> --summarize \"<user's task>\"", timeout: 600)
+
+EXEC RULES: Only pass "command" and "timeout". Do NOT pass security, ask, pty, elevated, host, yieldMs, or any other parameters. The defaults handle permissions.
 
 Step 3 — The output from step 2 is the summary. Print it as your final message. Include the session name "<session-name>" in your response.
 
@@ -53,7 +55,7 @@ Use the conversation/thread ID as suffix for session naming (e.g., `oc-gemini-13
 
 ```
 sessions_spawn(
-  task: "You are a worker subagent. You MUST complete ALL steps below sequentially. Do NOT say \"dispatched\" or stop early. Wait for each command to finish before running the next.\n\nStep 1 — Ensure session (WAIT for completion, do NOT background):\nexec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name oc-gemini-1346 --agent \"gemini --experimental-acp --yolo -m auto-gemini-3\" --startup-timeout 60 --quiet\n\nStep 2 — Send prompt and wait for result (this may take several minutes — WAIT for it):\nexec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s oc-gemini-1346 --summarize \"check the deployment status\"\n\nStep 3 — The output from step 2 is the summary. Print it as your final message. Include the session name \"oc-gemini-1346\" in your response.\n\nIMPORTANT: Do NOT stop after step 1. You must run step 2 and wait for it. The prompt command blocks until the coding agent finishes. If any step fails, report the error with the session name.",
+  task: "You are a worker subagent. You MUST complete ALL steps below sequentially. Do NOT say \"dispatched\" or stop early. Wait for each command to finish before running the next.\n\nStep 1 — Ensure session (WAIT for completion, do NOT background):\nexec(command: \"~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name oc-gemini-1346 --agent \\\"gemini --experimental-acp --yolo -m auto-gemini-3\\\" --startup-timeout 60 --quiet\", timeout: 120)\n\nStep 2 — Send prompt and wait for result (this may take several minutes — WAIT for it):\nexec(command: \"~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s oc-gemini-1346 --summarize \\\"check the deployment status\\\"\", timeout: 600)\n\nEXEC RULES: Only pass command and timeout. Do NOT pass security, ask, pty, elevated, host, yieldMs, or any other parameters.\n\nStep 3 — The output from step 2 is the summary. Print it as your final message. Include the session name \"oc-gemini-1346\" in your response.\n\nIMPORTANT: Do NOT stop after step 1. You must run step 2 and wait for it. The prompt command blocks until the coding agent finishes. If any step fails, report the error with the session name.",
   runtime: "subagent",
   mode: "run",
   label: "gemini: check deployment status"
