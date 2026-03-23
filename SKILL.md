@@ -23,19 +23,20 @@ sessions_spawn(
 
 ### Task template
 
-The `task` parameter must include acpx-rs instructions so the subagent knows how to run the coding agent:
+The `task` parameter must include explicit acpx-rs instructions. The subagent is a simple worker — be very explicit:
 
 ```
-Run the following task using <Agent> via acpx-rs:
+You are a worker subagent. You MUST complete ALL steps below sequentially. Do NOT say "dispatched" or stop early. Wait for each command to finish before running the next.
 
-Task: <user's task description>
+Step 1 — Ensure session (WAIT for completion, do NOT background):
+exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name <session-name> --agent "<agent-command>" --startup-timeout 60 --quiet
 
-Instructions:
-1. Run: exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name <session-name> --agent "<agent-command>" --startup-timeout 60 --quiet
-2. Run: exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s <session-name> --summarize "<user's task>"
-3. The prompt command will block until the agent finishes and print a summary. Report the summary as your final message.
+Step 2 — Send prompt and wait for result (this may take several minutes — WAIT for it):
+exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s <session-name> --summarize "<user's task>"
 
-If step 1 or 2 fails, report the error.
+Step 3 — The output from step 2 is the summary. Print it as your final message. Include the session name "<session-name>" in your response.
+
+IMPORTANT: Do NOT stop after step 1. You must run step 2 and wait for it. The prompt command blocks until the coding agent finishes. If any step fails, report the error with the session name.
 ```
 
 ## Agent commands and session names
@@ -52,7 +53,7 @@ Use the conversation/thread ID as suffix for session naming (e.g., `oc-gemini-13
 
 ```
 sessions_spawn(
-  task: "Run the following task using Gemini via acpx-rs:\n\nTask: check the deployment status\n\nInstructions:\n1. Run: exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name oc-gemini-1346 --agent \"gemini --experimental-acp --yolo -m auto-gemini-3\" --startup-timeout 60 --quiet\n2. Run: exec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s oc-gemini-1346 --summarize \"check the deployment status\"\n3. The prompt command will block until the agent finishes and print a summary. Report the summary as your final message.\n\nIf step 1 or 2 fails, report the error.",
+  task: "You are a worker subagent. You MUST complete ALL steps below sequentially. Do NOT say \"dispatched\" or stop early. Wait for each command to finish before running the next.\n\nStep 1 — Ensure session (WAIT for completion, do NOT background):\nexec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs sessions ensure --name oc-gemini-1346 --agent \"gemini --experimental-acp --yolo -m auto-gemini-3\" --startup-timeout 60 --quiet\n\nStep 2 — Send prompt and wait for result (this may take several minutes — WAIT for it):\nexec ~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s oc-gemini-1346 --summarize \"check the deployment status\"\n\nStep 3 — The output from step 2 is the summary. Print it as your final message. Include the session name \"oc-gemini-1346\" in your response.\n\nIMPORTANT: Do NOT stop after step 1. You must run step 2 and wait for it. The prompt command blocks until the coding agent finishes. If any step fails, report the error with the session name.",
   runtime: "subagent",
   mode: "run",
   label: "gemini: check deployment status"
@@ -61,7 +62,7 @@ sessions_spawn(
 
 ## After dispatching
 
-1. Tell the user: "Dispatched to `<agent>`. I'll report back when it's done."
+1. Tell the user the session name and the subagent session ID (from sessions_spawn response): "Dispatched to `<agent>` (session: `<session-name>`, subagent: `<childSessionKey>`). I'll report back when it's done."
 2. Continue handling other messages — the result will be announced back automatically.
 3. When the result arrives, deliver it to the user and answer any follow-up questions.
 
