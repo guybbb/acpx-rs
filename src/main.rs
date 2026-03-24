@@ -1020,14 +1020,39 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
     let record_path = paths.record_path(&args.session);
     let record = load_record(&record_path)
         .with_context(|| format!("session '{}' does not exist; run sessions ensure", args.session))?;
-    if record.closed {
-        let base = format!("session '{}' is closed", args.session);
-        let msg = match &record.death_reason {
-            Some(reason) => format!("{base}: {reason}"),
-            None => base,
+
+    // Check if session needs respawning (closed or stale).
+    let needs_respawn = if record.closed {
+        true
+    } else {
+        let pid_alive = record.pid.map(|p| process_alive(p)).unwrap_or(false);
+        !pid_alive
+    };
+
+    let record = if needs_respawn {
+        let reason = record.death_reason.clone()
+            .unwrap_or_else(|| if record.closed { "session was closed".to_string() } else { "daemon not running".to_string() });
+        eprintln!("warning: session '{}' is dead ({}), auto-respawning…", args.session, reason);
+
+        // Respawn using the old record's agent command and cwd
+        let ensure_args = EnsureArgs {
+            name: args.session.clone(),
+            agent: record.agent_command.clone(),
+            cwd: PathBuf::from(&record.cwd),
+            startup_timeout: 60,
+            model: record.config_model.clone(),
+            mode: record.config_mode.clone(),
+            quiet: true,
         };
-        bail!("{msg}");
-    }
+        run_sessions_ensure(paths, ensure_args)
+            .with_context(|| format!("failed to auto-respawn session '{}'", args.session))?;
+
+        // Reload the fresh record
+        load_record(&record_path)
+            .with_context(|| format!("session '{}' respawned but record not found", args.session))?
+    } else {
+        record
+    };
 
     let callback = match &args.callback {
         Some(cb_str) => Some(parse_callback(cb_str)?),
