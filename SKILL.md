@@ -30,7 +30,7 @@ exec(command: "~/.openclaw/workspace/skills/acpx-rs/acpx-rs prompt -s <session-n
 
 | Agent | Session prefix | Command |
 |-------|---------------|---------|
-| Gemini | `oc-gemini-` | `gemini --experimental-acp --yolo` |
+| Gemini | `oc-gemini-` | `gemini --experimental-acp --yolo -m gemini-3-flash-preview` |
 | Codex | `oc-codex-` | `npx -y @zed-industries/codex-acp` |
 | Claude | `oc-claude-` | `npx -y @zed-industries/claude-agent-acp` |
 | Investment | `oc-invest-` | `/home/openclaw/.openclaw/workspace-trading/trading-app/.venv/bin/python /home/openclaw/.openclaw/workspace-trading/trading-app/run.py --investment-agent-acp` |
