@@ -315,7 +315,7 @@ struct AcpClient {
 const STDERR_TAIL_LINES: usize = 50;
 
 impl AcpClient {
-    fn start(agent_command: &str, cwd: &Path, log_path: PathBuf) -> Result<Self> {
+    fn start(agent_command: &str, cwd: &Path, log_path: PathBuf, session_name: &str) -> Result<Self> {
         let (command, args) = split_command_line(agent_command)?;
         let mut cmd = Command::new(&command);
         cmd.args(args);
@@ -324,6 +324,8 @@ impl AcpClient {
             cmd.current_dir(cwd);
         }
         cmd.env_remove("CLAUDECODE");
+        // Stable session identity so the agent can persist/resume across daemon respawns.
+        cmd.env("ACPX_SESSION_NAME", session_name);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -990,8 +992,25 @@ fn request_summary(socket_path: &str, session_name: &str) -> Result<String> {
         Include: what was done, the outcome (success/failure), and any issues. \
         Be specific about file names, URLs, or commands. No preamble, just the bullet points.";
 
-    let mut stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("session '{}' not reachable for summary", session_name))?;
+    // Brief retry around the connect to absorb the narrow race that can occur
+    // right after an auto-respawn: the main-prompt connection completed via
+    // the previous daemon's socket, the daemon may still be re-binding for
+    // the next request when request_summary fires. Retry for up to 2s.
+    let connect_deadline = std::time::Instant::now() + Duration::from_millis(2000);
+    let mut stream = loop {
+        match UnixStream::connect(socket_path) {
+            Ok(s) => break s,
+            Err(_) if std::time::Instant::now() < connect_deadline => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("session '{}' not reachable for summary", session_name)
+                });
+            }
+        }
+    };
     let request = OwnerRequest::Prompt { text: summary_prompt.to_string() };
     write_line_json(&mut stream, &request)?;
 
@@ -1176,6 +1195,11 @@ fn run_prompt(paths: &SessionPaths, args: PromptArgs) -> Result<()> {
                             println!("(task completed but summary failed)");
                         }
                     }
+                    // Explicit flush — other branches flush after println so a
+                    // pipe-capturing caller (skill exec, openclaw plugin) sees
+                    // the output even if the process is torn down before
+                    // Rust's drop-time stdout flush completes.
+                    let _ = std::io::stdout().flush();
                     return Ok(());
                 }
                 OwnerEvent::Error { message } => {
@@ -1491,7 +1515,7 @@ fn run_session_daemon(home: &Path, record_path: &Path) -> Result<()> {
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
 
     let cwd = PathBuf::from(&record.cwd);
-    let mut client = AcpClient::start(&record.agent_command, &cwd, paths.log_path(&record.name))?;
+    let mut client = AcpClient::start(&record.agent_command, &cwd, paths.log_path(&record.name), &record.name)?;
     let info = client.new_session(&cwd)?;
     let session_id = info.session_id;
 
